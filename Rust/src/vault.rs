@@ -1,7 +1,6 @@
 use crate::{crypto::{aes_gcm_decrypt, aes_gcm_encrypt, derive_container_key}, identity::ProcessManifest, platform};
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, path::{Path, PathBuf}, sync::Mutex, time::{SystemTime, UNIX_EPOCH}};
 use zeroize::{Zeroize, Zeroizing};
@@ -76,7 +75,7 @@ impl Vault {
             packed.extend_from_slice(&B64.decode(envelope.nonce)?);
             packed.extend_from_slice(&blob);
             let plaintext = aes_gcm_decrypt(&master[..], &packed, OUTER_AAD).context("authenticating TPM.bin")?;
-            let mut idx: VaultIndex = serde_json::from_slice(&plaintext)?;
+            let idx: VaultIndex = serde_json::from_slice(&plaintext)?;
             if idx.version != VERSION { bail!("vault payload version mismatch"); }
             // The outer AEAD authenticates the index. Reject malformed IDs rather than
             // silently dropping a container and making it appear to have lost data.

@@ -1,5 +1,5 @@
 use aes_gcm::{aead::{Aead, KeyInit, Payload}, Aes256Gcm, Nonce};
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
 use rand::{rngs::OsRng, RngCore};
 use zeroize::Zeroizing;
@@ -11,10 +11,13 @@ const NONCE_LEN: usize = 12;
 /// Authenticated AES-256-GCM. The returned framing is magic || nonce || ciphertext+tag.
 pub fn aes_gcm_encrypt(key: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     if key.len() != 32 { bail!("AES-256-GCM requires a 32-byte key"); }
-    let cipher = Aes256Gcm::new_from_slice(key)?;
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|_| anyhow!("invalid AES-256-GCM key length"))?;
     let mut nonce = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
-    let body = cipher.encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad })?;
+    let body = cipher
+        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad })
+        .map_err(|_| anyhow!("AES-256-GCM encryption failed"))?;
     let mut out = Vec::with_capacity(4 + NONCE_LEN + body.len());
     out.extend_from_slice(AES_MAGIC);
     out.extend_from_slice(&nonce);
@@ -26,21 +29,27 @@ pub fn aes_gcm_decrypt(key: &[u8], blob: &[u8], aad: &[u8]) -> Result<Zeroizing<
     if key.len() != 32 || blob.len() < 4 + NONCE_LEN + 16 || &blob[..4] != AES_MAGIC {
         bail!("Invalid AES-GCM envelope");
     }
-    let cipher = Aes256Gcm::new_from_slice(key)?;
-    let pt = cipher.decrypt(
-        Nonce::from_slice(&blob[4..4 + NONCE_LEN]),
-        Payload { msg: &blob[4 + NONCE_LEN..], aad },
-    )?;
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|_| anyhow!("invalid AES-256-GCM key length"))?;
+    let pt = cipher
+        .decrypt(
+            Nonce::from_slice(&blob[4..4 + NONCE_LEN]),
+            Payload { msg: &blob[4 + NONCE_LEN..], aad },
+        )
+        .map_err(|_| anyhow!("AES-256-GCM authentication failed"))?;
     Ok(Zeroizing::new(pt))
 }
 
 /// Authenticated ChaCha20-Poly1305 for named application keys.
 pub fn chacha_encrypt(key: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     if key.len() != 32 { bail!("ChaCha20-Poly1305 requires a 32-byte key"); }
-    let cipher = ChaCha20Poly1305::new_from_slice(key)?;
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|_| anyhow!("invalid ChaCha20-Poly1305 key length"))?;
     let mut nonce = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
-    let body = cipher.encrypt(ChaChaNonce::from_slice(&nonce), Payload { msg: plaintext, aad })?;
+    let body = cipher
+        .encrypt(ChaChaNonce::from_slice(&nonce), Payload { msg: plaintext, aad })
+        .map_err(|_| anyhow!("ChaCha20-Poly1305 encryption failed"))?;
     let mut out = Vec::with_capacity(4 + NONCE_LEN + body.len());
     out.extend_from_slice(CHACHA_MAGIC);
     out.extend_from_slice(&nonce);
@@ -52,11 +61,14 @@ pub fn chacha_decrypt(key: &[u8], blob: &[u8], aad: &[u8]) -> Result<Zeroizing<V
     if key.len() != 32 || blob.len() < 4 + NONCE_LEN + 16 || &blob[..4] != CHACHA_MAGIC {
         bail!("Invalid ChaCha20-Poly1305 envelope");
     }
-    let cipher = ChaCha20Poly1305::new_from_slice(key)?;
-    let pt = cipher.decrypt(
-        ChaChaNonce::from_slice(&blob[4..4 + NONCE_LEN]),
-        Payload { msg: &blob[4 + NONCE_LEN..], aad },
-    )?;
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|_| anyhow!("invalid ChaCha20-Poly1305 key length"))?;
+    let pt = cipher
+        .decrypt(
+            ChaChaNonce::from_slice(&blob[4..4 + NONCE_LEN]),
+            Payload { msg: &blob[4 + NONCE_LEN..], aad },
+        )
+        .map_err(|_| anyhow!("ChaCha20-Poly1305 authentication failed"))?;
     Ok(Zeroizing::new(pt))
 }
 
