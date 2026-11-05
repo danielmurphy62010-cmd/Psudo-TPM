@@ -1,58 +1,71 @@
-name: Build Encryption and TPM (Windows)
+name: Build Psudo-TPM
 
 on:
   push:
-    branches:
-      - main
+    paths:
+      - 'Rust/**'
+      - '.github/workflows/build.yml'
+  pull_request:
+    paths:
+      - 'Rust/**'
+      - '.github/workflows/build.yml'
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   build:
-    name: Build TPM Windows Binary
-    runs-on: windows-latest
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+
+    defaults:
+      run:
+        working-directory: Rust
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v7.0.1
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          python-version: "3.14"
+          workspaces: Rust -> target
 
-      - name: Upgrade pip
-        run: python -m pip install --upgrade pip
+      - name: Compile and run tests
+        run: cargo test --all-targets
 
-      - name: Install dependencies
-        run: |
-          python -m pip install nuitka
-          python -m pip install cryptography argon2-cffi pywin32 zstandard numpy psutil pyyaml bcrypt
+      - name: Build optimized executable
+        run: cargo build --release --bin psudo-tpm
 
-      - name: Build modules and executable (Windows)
-        shell: pwsh
-        run: |
-          # 1. Build Encryption as an independent module
-          python -m nuitka `
-            --module `
-            --output-dir=dist `
-            Encryption.py
-
-          # 2. Build TPM as a standalone executable with Nuitka
-          python -m nuitka `
-            --standalone `
-            --onefile `
-            --output-dir=dist `
-            --include-module=Encryption `
-            --include-module=util `
-            --enable-plugin=anti-bloat `
-            --lto=yes `
-            --assume-yes-for-downloads `
-            TPM.py
-
-      - name: Upload Build Artifacts
-        uses: actions/upload-artifact@v4
+      - name: Upload Linux executable
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7.0.2
         with:
-          name: TPM-windows-binaries
-          path: |
-            dist
+          name: psudo-tpm-linux-x86_64
+          path: Rust/target/release/psudo-tpm
+          if-no-files-found: error
+
+      - name: Upload Windows executable
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: psudo-tpm-windows-x86_64
+          path: Rust/target/release/psudo-tpm.exe
           if-no-files-found: error
