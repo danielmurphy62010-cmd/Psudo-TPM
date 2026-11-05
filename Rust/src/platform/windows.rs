@@ -8,7 +8,6 @@ use zeroize::Zeroizing;
 type NcryptHandle = usize;
 const NTE_BAD_KEYSET: i32 = 0x8009_0016u32 as i32;
 const NCRYPT_PAD_OAEP_FLAG: u32 = 0x0000_0004;
-const NCRYPT_PERSIST_FLAG: u32 = 0x8000_0000;
 const NCRYPT_IMPL_HARDWARE_FLAG: u32 = 0x0000_0001;
 const NCRYPT_IMPL_SOFTWARE_FLAG: u32 = 0x0000_0002;
 const NCRYPT_ALLOW_DECRYPT_FLAG: u32 = 0x0000_0001;
@@ -46,9 +45,9 @@ impl Drop for CngKey {
 impl CngKey {
     fn open_or_create() -> Result<Self> {
         let provider_name = wide("Microsoft Platform Crypto Provider");
-        // The v2 name avoids re-opening an unfinished RSA-3072 key left behind
-        // by earlier builds that failed during NCryptSetProperty("Length").
-        let key_name = wide("PsudoTPM.MasterKey.RSA2048.v2");
+        // The v3 name avoids re-opening the existing v2 key, whose usage property
+        // was persisted with broader permissions than this build requires.
+        let key_name = wide("PsudoTPM.MasterKey.RSA2048.v3");
         let rsa = wide("RSA");
         let mut provider = 0usize;
         let mut key = 0usize;
@@ -87,7 +86,8 @@ impl CngKey {
 
             // Configure the key before finalizing it. The TPM-backed provider
             // rejects RSA-3072 on many systems; RSA-2048 is the interoperable size.
-            // NCRYPT_PERSIST_FLAG ensures the properties are stored with the key.
+            // For NCryptSetProperty, use dwFlags=0. NCRYPT_PERSIST_FLAG belongs
+            // to persisted-key creation semantics and is not the correct flag here.
             let create_result = (|| -> Result<()> {
                 let bits = RSA_BITS;
                 check(
@@ -97,7 +97,7 @@ impl CngKey {
                             wide("Length").as_ptr(),
                             &bits as *const _ as *const u8,
                             std::mem::size_of::<u32>() as u32,
-                            NCRYPT_PERSIST_FLAG,
+                            0,
                         )
                     },
                     "set RSA-2048 length",
@@ -111,7 +111,7 @@ impl CngKey {
                             wide("Key Usage").as_ptr(),
                             &decrypt_only as *const _ as *const u8,
                             std::mem::size_of::<u32>() as u32,
-                            NCRYPT_PERSIST_FLAG,
+                            0,
                         )
                     },
                     "set RSA decrypt-only key usage",
