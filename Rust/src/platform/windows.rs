@@ -1,227 +1,180 @@
 use anyhow::{bail, Context, Result};
 use rand::{rngs::OsRng, RngCore};
-use std::{ffi::c_void, fs, path::Path};
-use zeroize::Zeroizing;
+use std::{ffi::c_void, fs, io, path::Path, slice};
+use zeroize::{Zeroize, Zeroizing};
 
-// CNG / NCrypt. The private RSA key is persisted in the Microsoft Platform Crypto
-// Provider. No private-key export API is called by this project.
-type NcryptHandle = usize;
-const NTE_BAD_KEYSET: i32 = 0x8009_0016u32 as i32;
-const NCRYPT_PAD_OAEP_FLAG: u32 = 0x0000_0004;
-const NCRYPT_IMPL_HARDWARE_FLAG: u32 = 0x0000_0001;
-const NCRYPT_IMPL_SOFTWARE_FLAG: u32 = 0x0000_0002;
-const NCRYPT_ALLOW_DECRYPT_FLAG: u32 = 0x0000_0001;
-// The Microsoft Platform Crypto Provider's TPM-backed RSA path is commonly
-// limited to 2048-bit keys. 3072-bit requests are rejected by the KSP on many
-// systems with NTE_INVALID_PARAMETER (0x80090027).
-const RSA_BITS: u32 = 2048;
+// Windows DPAPI. By intentionally omitting CRYPTPROTECT_LOCAL_MACHINE, the
+// wrapped vault key is tied to the current Windows user profile (and normally
+// this computer), rather than being decryptable by every local user.
+const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x0000_0001;
+const DPAPI_MAGIC: &[u8; 8] = b"PTPMDP01";
+const DPAPI_ENTROPY: &[u8] = b"Psudo-TPM\0vault-master-key\0v1";
 
 #[repr(C)]
-struct BcryptOaepPaddingInfo {
-    hash_algorithm: *const u16,
-    label: *mut u8,
-    label_length: u32,
+struct DataBlob {
+    cb_data: u32,
+    pb_data: *mut u8,
 }
 
-#[link(name = "ncrypt")]
+#[link(name = "crypt32")]
 unsafe extern "system" {
-    fn NCryptOpenStorageProvider(provider: *mut NcryptHandle, name: *const u16, flags: u32) -> i32;
-    fn NCryptCreatePersistedKey(provider: NcryptHandle, key: *mut NcryptHandle, alg: *const u16, name: *const u16, legacy_spec: u32, flags: u32) -> i32;
-    fn NCryptOpenKey(provider: NcryptHandle, key: *mut NcryptHandle, name: *const u16, legacy_spec: u32, flags: u32) -> i32;
-    fn NCryptSetProperty(handle: NcryptHandle, property: *const u16, input: *const u8, input_len: u32, flags: u32) -> i32;
-    fn NCryptGetProperty(handle: NcryptHandle, property: *const u16, output: *mut u8, output_len: u32, result_len: *mut u32, flags: u32) -> i32;
-    fn NCryptFinalizeKey(key: NcryptHandle, flags: u32) -> i32;
-    fn NCryptDeleteKey(key: NcryptHandle, flags: u32) -> i32;
-    fn NCryptEncrypt(key: NcryptHandle, input: *const u8, input_len: u32, padding: *const c_void, output: *mut u8, output_len: u32, result_len: *mut u32, flags: u32) -> i32;
-    fn NCryptDecrypt(key: NcryptHandle, input: *const u8, input_len: u32, padding: *const c_void, output: *mut u8, output_len: u32, result_len: *mut u32, flags: u32) -> i32;
-    fn NCryptFreeObject(handle: NcryptHandle) -> i32;
+    fn CryptProtectData(
+        data_in: *mut DataBlob,
+        description: *const u16,
+        optional_entropy: *mut DataBlob,
+        reserved: *mut c_void,
+        prompt: *mut c_void,
+        flags: u32,
+        data_out: *mut DataBlob,
+    ) -> i32;
+
+    fn CryptUnprotectData(
+        data_in: *mut DataBlob,
+        description: *mut *mut u16,
+        optional_entropy: *mut DataBlob,
+        reserved: *mut c_void,
+        prompt: *mut c_void,
+        flags: u32,
+        data_out: *mut DataBlob,
+    ) -> i32;
 }
 
-struct CngKey { provider: NcryptHandle, key: NcryptHandle }
-impl Drop for CngKey {
-    fn drop(&mut self) { unsafe { NCryptFreeObject(self.key); NCryptFreeObject(self.provider); } }
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn LocalFree(memory: *mut c_void) -> *mut c_void;
 }
 
-impl CngKey {
-    fn open_or_create() -> Result<Self> {
-        let provider_name = wide("Microsoft Platform Crypto Provider");
-        // The v3 name avoids re-opening the existing v2 key, whose usage property
-        // was persisted with broader permissions than this build requires.
-        let key_name = wide("PsudoTPM.MasterKey.RSA2048.v3");
-        let rsa = wide("RSA");
-        let mut provider = 0usize;
-        let mut key = 0usize;
-
-        let status = unsafe {
-            NCryptOpenStorageProvider(&mut provider, provider_name.as_ptr(), 0)
-        };
-        check(status, "NCryptOpenStorageProvider(Microsoft Platform Crypto Provider)")?;
-
-        // Fail closed if the opened KSP does not identify itself as hardware-backed.
-        // This prevents a future provider-name/configuration change from silently
-        // weakening the TPM-only requirement.
-        let impl_type = match get_u32(provider, "Impl Type") {
-            Ok(value) => value,
-            Err(error) => {
-                unsafe { NCryptFreeObject(provider); }
-                return Err(error).context("querying CNG provider implementation type");
-            }
-        };
-        if (impl_type & NCRYPT_IMPL_HARDWARE_FLAG) == 0
-            || (impl_type & NCRYPT_IMPL_SOFTWARE_FLAG) != 0
-        {
-            unsafe { NCryptFreeObject(provider); }
-            bail!("Microsoft Platform Crypto Provider did not report a hardware-only implementation (Impl Type={impl_type:#x})");
-        }
-
-        let status = unsafe { NCryptOpenKey(provider, &mut key, key_name.as_ptr(), 0, 0) };
-        if status == NTE_BAD_KEYSET {
-            let create_status = unsafe {
-                NCryptCreatePersistedKey(provider, &mut key, rsa.as_ptr(), key_name.as_ptr(), 0, 0)
-            };
-            if create_status != 0 {
-                unsafe { NCryptFreeObject(provider); }
-                check(create_status, "NCryptCreatePersistedKey(RSA-2048)")?;
-            }
-
-            // Configure the key before finalizing it. The TPM-backed provider
-            // rejects RSA-3072 on many systems; RSA-2048 is the interoperable size.
-            // For NCryptSetProperty, use dwFlags=0. NCRYPT_PERSIST_FLAG belongs
-            // to persisted-key creation semantics and is not the correct flag here.
-            let create_result = (|| -> Result<()> {
-                let bits = RSA_BITS;
-                check(
-                    unsafe {
-                        NCryptSetProperty(
-                            key,
-                            wide("Length").as_ptr(),
-                            &bits as *const _ as *const u8,
-                            std::mem::size_of::<u32>() as u32,
-                            0,
-                        )
-                    },
-                    "set RSA-2048 length",
-                )?;
-
-                let decrypt_only = NCRYPT_ALLOW_DECRYPT_FLAG;
-                check(
-                    unsafe {
-                        NCryptSetProperty(
-                            key,
-                            wide("Key Usage").as_ptr(),
-                            &decrypt_only as *const _ as *const u8,
-                            std::mem::size_of::<u32>() as u32,
-                            0,
-                        )
-                    },
-                    "set RSA decrypt-only key usage",
-                )?;
-
-                check(unsafe { NCryptFinalizeKey(key, 0) }, "NCryptFinalizeKey")?;
-                Ok(())
-            })();
-
-            if let Err(error) = create_result {
-                // DeleteKey closes the key handle when successful. If it fails,
-                // explicitly free the handle; always release the provider handle.
-                let delete_status = unsafe { NCryptDeleteKey(key, 0) };
-                if delete_status != 0 {
-                    unsafe { NCryptFreeObject(key); }
-                }
-                unsafe { NCryptFreeObject(provider); }
-                return Err(error);
-            }
-        } else if status != 0 {
-            unsafe { NCryptFreeObject(provider); }
-            check(status, "NCryptOpenKey")?;
-        }
-
-        // Do not set or read the generic "Export Policy" property here. The
-        // Microsoft Platform Crypto Provider may report it as unsupported. The
-        // key lives in the explicitly selected hardware KSP, and this program
-        // never calls NCryptExportKey or any private-key export API.
-        let validation = (|| -> Result<()> {
-            let key_length = get_u32(key, "Length")?;
-            let key_usage = get_u32(key, "Key Usage")?;
-            if key_length != RSA_BITS || key_usage != NCRYPT_ALLOW_DECRYPT_FLAG {
-                bail!("existing CNG key does not meet hardware-backed, decrypt-only RSA-2048 policy (length={key_length}, usage={key_usage:#x})");
-            }
-            Ok(())
-        })();
-        if let Err(error) = validation {
-            unsafe { NCryptFreeObject(key); NCryptFreeObject(provider); }
-            return Err(error);
-        }
-
-        Ok(Self { provider, key })
-    }
-
-    fn encrypt(&self, input: &[u8]) -> Result<Vec<u8>> { self.rsa_oaep(input, true) }
-    fn decrypt(&self, input: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        Ok(Zeroizing::new(self.rsa_oaep(input, false)?))
-    }
-
-    fn rsa_oaep(&self, input: &[u8], encrypt: bool) -> Result<Vec<u8>> {
-        let hash = wide("SHA256");
-        let padding = BcryptOaepPaddingInfo { hash_algorithm: hash.as_ptr(), label: std::ptr::null_mut(), label_length: 0 };
-        let mut needed = 0u32;
-        let first = unsafe {
-            if encrypt { NCryptEncrypt(self.key, input.as_ptr(), input.len() as u32, &padding as *const _ as *const c_void, std::ptr::null_mut(), 0, &mut needed, NCRYPT_PAD_OAEP_FLAG) }
-            else { NCryptDecrypt(self.key, input.as_ptr(), input.len() as u32, &padding as *const _ as *const c_void, std::ptr::null_mut(), 0, &mut needed, NCRYPT_PAD_OAEP_FLAG) }
-        };
-        check(first, "NCrypt RSA-OAEP size query")?;
-        let mut out = vec![0u8; needed as usize];
-        let mut actual = 0u32;
-        let status = unsafe {
-            if encrypt { NCryptEncrypt(self.key, input.as_ptr(), input.len() as u32, &padding as *const _ as *const c_void, out.as_mut_ptr(), out.len() as u32, &mut actual, NCRYPT_PAD_OAEP_FLAG) }
-            else { NCryptDecrypt(self.key, input.as_ptr(), input.len() as u32, &padding as *const _ as *const c_void, out.as_mut_ptr(), out.len() as u32, &mut actual, NCRYPT_PAD_OAEP_FLAG) }
-        };
-        check(status, "NCrypt RSA-OAEP operation")?;
-        out.truncate(actual as usize);
-        Ok(out)
-    }
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
 }
 
-pub fn load_or_create(root: &Path) -> Result<Zeroizing<[u8; 32]>> {
-    let path = root.join("master.rsa");
-    let cng = CngKey::open_or_create().context("opening TPM-backed Microsoft Platform Crypto Provider RSA key; this build deliberately does not fall back to a software private key")?;
-    if path.exists() {
-        let blob = fs::read(&path)?;
-        if blob.len() < 12 || &blob[..8] != b"PTPMRSA1" { bail!("invalid master.rsa envelope"); }
-        let secret = cng.decrypt(&blob[8..]).context("unwrapping vault master key with CNG RSA-OAEP")?;
-        if secret.len() != 32 { bail!("unwrapped master key has invalid length"); }
-        let mut key = Zeroizing::new([0u8; 32]);
-        key.copy_from_slice(&secret);
-        return Ok(key);
+fn input_blob(bytes: &[u8]) -> Result<DataBlob> {
+    let len = u32::try_from(bytes.len()).context("DPAPI input is larger than DWORD")?;
+    Ok(DataBlob { cb_data: len, pb_data: bytes.as_ptr() as *mut u8 })
+}
+
+unsafe fn free_blob(blob: &mut DataBlob, wipe: bool) {
+    if blob.pb_data.is_null() {
+        return;
     }
-    if root.join("TPM.bin").exists() {
-        bail!("TPM.bin exists but master.rsa is missing; refusing to generate a replacement master key");
+    if wipe && blob.cb_data != 0 {
+        // DPAPI allocates this buffer. Wipe plaintext before releasing it.
+        slice::from_raw_parts_mut(blob.pb_data, blob.cb_data as usize).zeroize();
     }
+    LocalFree(blob.pb_data.cast());
+    blob.pb_data = std::ptr::null_mut();
+    blob.cb_data = 0;
+}
+
+fn dpapi_protect(plaintext: &[u8]) -> Result<Vec<u8>> {
+    let mut input = input_blob(plaintext)?;
+    let mut entropy = input_blob(DPAPI_ENTROPY)?;
+    let mut output = DataBlob { cb_data: 0, pb_data: std::ptr::null_mut() };
+    let description = wide("Psudo-TPM vault master key");
+
+    let ok = unsafe {
+        CryptProtectData(
+            &mut input,
+            description.as_ptr(),
+            &mut entropy,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if ok == 0 {
+        let error = io::Error::last_os_error();
+        unsafe { free_blob(&mut output, false); }
+        return Err(error).context("CryptProtectData (current-user DPAPI)");
+    }
+    if output.pb_data.is_null() || output.cb_data == 0 {
+        unsafe { free_blob(&mut output, false); }
+        bail!("CryptProtectData returned an empty protected blob");
+    }
+
+    let protected = unsafe {
+        slice::from_raw_parts(output.pb_data, output.cb_data as usize).to_vec()
+    };
+    unsafe { free_blob(&mut output, false); }
+    Ok(protected)
+}
+
+fn dpapi_unprotect(protected: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+    let mut input = input_blob(protected)?;
+    let mut entropy = input_blob(DPAPI_ENTROPY)?;
+    let mut output = DataBlob { cb_data: 0, pb_data: std::ptr::null_mut() };
+
+    let ok = unsafe {
+        CryptUnprotectData(
+            &mut input,
+            std::ptr::null_mut(), // no description string requested
+            &mut entropy,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if ok == 0 {
+        let error = io::Error::last_os_error();
+        unsafe { free_blob(&mut output, true); }
+        return Err(error).context("CryptUnprotectData (current-user DPAPI)");
+    }
+    if output.pb_data.is_null() || output.cb_data != 32 {
+        let actual = output.cb_data;
+        unsafe { free_blob(&mut output, true); }
+        bail!("DPAPI returned an invalid master-key length ({actual}; expected 32)");
+    }
+
     let mut key = Zeroizing::new([0u8; 32]);
-    OsRng.fill_bytes(&mut *key);
-    let wrapped = cng.encrypt(&key[..]).context("wrapping new master key with CNG RSA-OAEP")?;
-    let mut data = b"PTPMRSA1".to_vec();
-    data.extend_from_slice(&wrapped);
-    atomic_write(&path, &data)?;
+    unsafe {
+        key.copy_from_slice(slice::from_raw_parts(output.pb_data, 32));
+        free_blob(&mut output, true);
+    }
     Ok(key)
 }
 
-fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(Some(0)).collect() }
-fn get_u32(handle: NcryptHandle, property: &str) -> Result<u32> {
-    let mut value = 0u32;
-    let mut size = 0u32;
-    check(unsafe { NCryptGetProperty(handle, wide(property).as_ptr(), &mut value as *mut _ as *mut u8, 4, &mut size, 0) }, "NCryptGetProperty")?;
-    if size != 4 { bail!("CNG property {property} returned an unexpected size"); }
-    Ok(value)
+/// Load or create a random 256-bit AES master key protected by Windows DPAPI.
+///
+/// DPAPI protects only the small master key at rest. The vault data itself and
+/// all per-container blobs are encrypted by the vault layer with AES-256-GCM.
+pub fn load_or_create(root: &Path) -> Result<Zeroizing<[u8; 32]>> {
+    let path = root.join("master.dpapi");
+
+    if path.exists() {
+        let blob = fs::read(&path).context("reading master.dpapi")?;
+        if blob.len() <= DPAPI_MAGIC.len() || &blob[..DPAPI_MAGIC.len()] != DPAPI_MAGIC {
+            bail!("invalid master.dpapi envelope");
+        }
+        return dpapi_unprotect(&blob[DPAPI_MAGIC.len()..])
+            .context("unprotecting vault master key with current-user DPAPI");
+    }
+
+    // Never silently create a new master key for an existing vault. Doing so
+    // would make the existing TPM.bin and its backups permanently unreadable.
+    if root.join("TPM.bin").exists() {
+        bail!("TPM.bin exists but master.dpapi is missing; refusing to generate a replacement master key");
+    }
+
+    let mut key = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(&mut *key);
+    let protected = dpapi_protect(&key[..]).context("protecting new AES-256 master key with current-user DPAPI")?;
+
+    let mut envelope = Vec::with_capacity(DPAPI_MAGIC.len() + protected.len());
+    envelope.extend_from_slice(DPAPI_MAGIC);
+    envelope.extend_from_slice(&protected);
+    atomic_write(&path, &envelope).context("writing master.dpapi")?;
+    Ok(key)
 }
-fn check(status: i32, what: &str) -> Result<()> {
-    if status == 0 { Ok(()) } else { bail!("{what} failed: SECURITY_STATUS {status:#x}") }
-}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, bytes)?;
     let f = fs::OpenOptions::new().read(true).open(&tmp)?;
     f.sync_all()?;
+    // This target is a one-time-created key file; an existing master.dpapi is
+    // never overwritten by initialization.
     fs::rename(&tmp, path)?;
     Ok(())
 }
