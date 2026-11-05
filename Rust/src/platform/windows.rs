@@ -8,7 +8,14 @@ use zeroize::Zeroizing;
 type NcryptHandle = usize;
 const NTE_BAD_KEYSET: i32 = 0x8009_0016u32 as i32;
 const NCRYPT_PAD_OAEP_FLAG: u32 = 0x0000_0004;
-const RSA_BITS: u32 = 3072;
+const NCRYPT_PERSIST_FLAG: u32 = 0x8000_0000;
+const NCRYPT_IMPL_HARDWARE_FLAG: u32 = 0x0000_0001;
+const NCRYPT_IMPL_SOFTWARE_FLAG: u32 = 0x0000_0002;
+const NCRYPT_ALLOW_DECRYPT_FLAG: u32 = 0x0000_0001;
+// The Microsoft Platform Crypto Provider's TPM-backed RSA path is commonly
+// limited to 2048-bit keys. 3072-bit requests are rejected by the KSP on many
+// systems with NTE_INVALID_PARAMETER (0x80090027).
+const RSA_BITS: u32 = 2048;
 
 #[repr(C)]
 struct BcryptOaepPaddingInfo {
@@ -25,6 +32,7 @@ unsafe extern "system" {
     fn NCryptSetProperty(handle: NcryptHandle, property: *const u16, input: *const u8, input_len: u32, flags: u32) -> i32;
     fn NCryptGetProperty(handle: NcryptHandle, property: *const u16, output: *mut u8, output_len: u32, result_len: *mut u32, flags: u32) -> i32;
     fn NCryptFinalizeKey(key: NcryptHandle, flags: u32) -> i32;
+    fn NCryptDeleteKey(key: NcryptHandle, flags: u32) -> i32;
     fn NCryptEncrypt(key: NcryptHandle, input: *const u8, input_len: u32, padding: *const c_void, output: *mut u8, output_len: u32, result_len: *mut u32, flags: u32) -> i32;
     fn NCryptDecrypt(key: NcryptHandle, input: *const u8, input_len: u32, padding: *const c_void, output: *mut u8, output_len: u32, result_len: *mut u32, flags: u32) -> i32;
     fn NCryptFreeObject(handle: NcryptHandle) -> i32;
@@ -38,37 +46,113 @@ impl Drop for CngKey {
 impl CngKey {
     fn open_or_create() -> Result<Self> {
         let provider_name = wide("Microsoft Platform Crypto Provider");
-        let key_name = wide("PsudoTPM.MasterKey.RSA3072.v1");
+        // The v2 name avoids re-opening an unfinished RSA-3072 key left behind
+        // by earlier builds that failed during NCryptSetProperty("Length").
+        let key_name = wide("PsudoTPM.MasterKey.RSA2048.v2");
         let rsa = wide("RSA");
         let mut provider = 0usize;
         let mut key = 0usize;
-        let status = unsafe { NCryptOpenStorageProvider(&mut provider, provider_name.as_ptr(), 0) };
+
+        let status = unsafe {
+            NCryptOpenStorageProvider(&mut provider, provider_name.as_ptr(), 0)
+        };
         check(status, "NCryptOpenStorageProvider(Microsoft Platform Crypto Provider)")?;
+
+        // Fail closed if the opened KSP does not identify itself as hardware-backed.
+        // This prevents a future provider-name/configuration change from silently
+        // weakening the TPM-only requirement.
+        let impl_type = match get_u32(provider, "Impl Type") {
+            Ok(value) => value,
+            Err(error) => {
+                unsafe { NCryptFreeObject(provider); }
+                return Err(error).context("querying CNG provider implementation type");
+            }
+        };
+        if (impl_type & NCRYPT_IMPL_HARDWARE_FLAG) == 0
+            || (impl_type & NCRYPT_IMPL_SOFTWARE_FLAG) != 0
+        {
+            unsafe { NCryptFreeObject(provider); }
+            bail!("Microsoft Platform Crypto Provider did not report a hardware-only implementation (Impl Type={impl_type:#x})");
+        }
+
         let status = unsafe { NCryptOpenKey(provider, &mut key, key_name.as_ptr(), 0, 0) };
         if status == NTE_BAD_KEYSET {
-            check(unsafe { NCryptCreatePersistedKey(provider, &mut key, rsa.as_ptr(), key_name.as_ptr(), 0, 0) }, "NCryptCreatePersistedKey(RSA)")?;
-            let bits = RSA_BITS;
-            let no_export = 0u32;
-            // The private key is only used to decrypt the wrapped master key.
-            // RSA public-key encryption does not require private-key signing usage.
-            let decrypt_only = 0x0000_0001u32;
-            check(unsafe { NCryptSetProperty(key, wide("Length").as_ptr(), &bits as *const _ as *const u8, 4, 0) }, "set RSA length")?;
-            check(unsafe { NCryptSetProperty(key, wide("Export Policy").as_ptr(), &no_export as *const _ as *const u8, 4, 0) }, "disable private-key export")?;
-            check(unsafe { NCryptSetProperty(key, wide("Key Usage").as_ptr(), &decrypt_only as *const _ as *const u8, 4, 0) }, "set RSA key usage")?;
-            check(unsafe { NCryptFinalizeKey(key, 0) }, "NCryptFinalizeKey")?;
+            let create_status = unsafe {
+                NCryptCreatePersistedKey(provider, &mut key, rsa.as_ptr(), key_name.as_ptr(), 0, 0)
+            };
+            if create_status != 0 {
+                unsafe { NCryptFreeObject(provider); }
+                check(create_status, "NCryptCreatePersistedKey(RSA-2048)")?;
+            }
+
+            // Configure the key before finalizing it. The TPM-backed provider
+            // rejects RSA-3072 on many systems; RSA-2048 is the interoperable size.
+            // NCRYPT_PERSIST_FLAG ensures the properties are stored with the key.
+            let create_result = (|| -> Result<()> {
+                let bits = RSA_BITS;
+                check(
+                    unsafe {
+                        NCryptSetProperty(
+                            key,
+                            wide("Length").as_ptr(),
+                            &bits as *const _ as *const u8,
+                            std::mem::size_of::<u32>() as u32,
+                            NCRYPT_PERSIST_FLAG,
+                        )
+                    },
+                    "set RSA-2048 length",
+                )?;
+
+                let decrypt_only = NCRYPT_ALLOW_DECRYPT_FLAG;
+                check(
+                    unsafe {
+                        NCryptSetProperty(
+                            key,
+                            wide("Key Usage").as_ptr(),
+                            &decrypt_only as *const _ as *const u8,
+                            std::mem::size_of::<u32>() as u32,
+                            NCRYPT_PERSIST_FLAG,
+                        )
+                    },
+                    "set RSA decrypt-only key usage",
+                )?;
+
+                check(unsafe { NCryptFinalizeKey(key, 0) }, "NCryptFinalizeKey")?;
+                Ok(())
+            })();
+
+            if let Err(error) = create_result {
+                // DeleteKey closes the key handle when successful. If it fails,
+                // explicitly free the handle; always release the provider handle.
+                let delete_status = unsafe { NCryptDeleteKey(key, 0) };
+                if delete_status != 0 {
+                    unsafe { NCryptFreeObject(key); }
+                }
+                unsafe { NCryptFreeObject(provider); }
+                return Err(error);
+            }
         } else if status != 0 {
             unsafe { NCryptFreeObject(provider); }
             check(status, "NCryptOpenKey")?;
         }
-        // Do not trust a pre-existing key with our name. Verify it is the expected
-        // size, non-exportable, and has the required public/private operation usage.
-        let export_policy = get_u32(key, "Export Policy")?;
-        let key_length = get_u32(key, "Length")?;
-        let key_usage = get_u32(key, "Key Usage")?;
-        if export_policy != 0 || key_length != RSA_BITS || key_usage != 0x1 {
+
+        // Do not set or read the generic "Export Policy" property here. The
+        // Microsoft Platform Crypto Provider may report it as unsupported. The
+        // key lives in the explicitly selected hardware KSP, and this program
+        // never calls NCryptExportKey or any private-key export API.
+        let validation = (|| -> Result<()> {
+            let key_length = get_u32(key, "Length")?;
+            let key_usage = get_u32(key, "Key Usage")?;
+            if key_length != RSA_BITS || key_usage != NCRYPT_ALLOW_DECRYPT_FLAG {
+                bail!("existing CNG key does not meet hardware-backed, decrypt-only RSA-2048 policy (length={key_length}, usage={key_usage:#x})");
+            }
+            Ok(())
+        })();
+        if let Err(error) = validation {
             unsafe { NCryptFreeObject(key); NCryptFreeObject(provider); }
-            bail!("existing CNG key does not meet non-exportable, decrypt-only RSA-3072 policy");
+            return Err(error);
         }
+
         Ok(Self { provider, key })
     }
 
